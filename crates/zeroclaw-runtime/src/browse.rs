@@ -392,6 +392,149 @@ pub fn move_agent_workspace_path(
     Ok(())
 }
 
+// ── Shared workspace file operations ────────────────────────────────────
+
+const SHARED_UPLOAD_CAP: u64 = 10 * 1024 * 1024; // 10 MiB
+
+/// Write file contents into `<install>/shared/<relative_path>`. Creates
+/// parent directories as needed. Rejects path traversal and oversize payloads.
+pub fn write_file(config: &Config, relative_path: &str, data: &[u8]) -> Result<u64, BrowseError> {
+    let trimmed = relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(BrowseError::NotFound(relative_path.to_string()));
+    }
+    if data.len() as u64 > SHARED_UPLOAD_CAP {
+        return Err(BrowseError::TooLarge(relative_path.to_string(), SHARED_UPLOAD_CAP));
+    }
+    let shared = config.shared_workspace_dir();
+    let resolved: PathBuf = resolve_under(&shared, trimmed)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&resolved, data)?;
+    Ok(data.len() as u64)
+}
+
+/// Create an empty file at `<install>/shared/<relative_path>`.
+pub fn create_file(config: &Config, relative_path: &str) -> Result<String, BrowseError> {
+    let trimmed = relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(BrowseError::NotFound(relative_path.to_string()));
+    }
+    let shared = config.shared_workspace_dir();
+    let resolved: PathBuf = resolve_under(&shared, trimmed)?;
+    if resolved.exists() {
+        return Err(BrowseError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("path '{trimmed}' already exists"),
+        )));
+    }
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&resolved, "")?;
+    Ok(trimmed.to_string())
+}
+
+/// Read a file from `<install>/shared/<relative_path>`. Enforces size cap.
+pub fn read_shared_file(config: &Config, relative_path: &str) -> Result<FileReadResult, BrowseError> {
+    let trimmed = relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(BrowseError::NotFound(relative_path.to_string()));
+    }
+    let shared = config.shared_workspace_dir();
+    let resolved: PathBuf = resolve_under(&shared, trimmed)?;
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BrowseError::NotFound(trimmed.to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.is_file() {
+        return Err(BrowseError::NotADirectory(trimmed.to_string()));
+    }
+    if metadata.len() > AGENT_WORKSPACE_READ_CAP {
+        return Err(BrowseError::TooLarge(trimmed.to_string(), AGENT_WORKSPACE_READ_CAP));
+    }
+    let bytes = std::fs::read(&resolved)?;
+    let is_text = std::str::from_utf8(&bytes).is_ok();
+    Ok(FileReadResult {
+        path: trimmed.to_string(),
+        size: metadata.len(),
+        bytes,
+        is_text,
+    })
+}
+
+/// Delete a file or directory at `<install>/shared/<relative_path>`.
+/// Refuses protected top-level entries.
+pub fn delete_shared_path(config: &Config, relative_path: &str) -> Result<(), BrowseError> {
+    let trimmed = relative_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(BrowseError::Protected("shared".to_string()));
+    }
+    let top = trimmed.split('/').next().unwrap_or("");
+    if PROTECTED_SHARED_TOP_LEVEL.contains(&top) && !trimmed.contains('/') {
+        return Err(BrowseError::Protected(format!("shared/{top}")));
+    }
+    let shared = config.shared_workspace_dir();
+    let resolved: PathBuf = resolve_under(&shared, trimmed)?;
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BrowseError::NotFound(trimmed.to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&resolved)?;
+    } else {
+        std::fs::remove_file(&resolved)?;
+    }
+    Ok(())
+}
+
+/// Move/rename a path under `<install>/shared/`. Both `from` and `to`
+/// must stay inside shared/. Refuses to touch protected top-level entries.
+pub fn move_shared_path(config: &Config, from: &str, to: &str) -> Result<(), BrowseError> {
+    let from_trimmed = from.trim_matches('/');
+    let to_trimmed = to.trim_matches('/');
+    if from_trimmed.is_empty() || to_trimmed.is_empty() {
+        return Err(BrowseError::NotFound(from.to_string()));
+    }
+    let from_top = from_trimmed.split('/').next().unwrap_or("");
+    let to_top = to_trimmed.split('/').next().unwrap_or("");
+    if (PROTECTED_SHARED_TOP_LEVEL.contains(&from_top) && !from_trimmed.contains('/'))
+        || (PROTECTED_SHARED_TOP_LEVEL.contains(&to_top) && !to_trimmed.contains('/'))
+    {
+        return Err(BrowseError::Protected(format!(
+            "shared/{}",
+            if PROTECTED_SHARED_TOP_LEVEL.contains(&from_top) && !from_trimmed.contains('/') {
+                from_top
+            } else {
+                to_top
+            }
+        )));
+    }
+    let shared = config.shared_workspace_dir();
+    let src: PathBuf = resolve_under(&shared, from_trimmed)?;
+    let dst: PathBuf = resolve_under(&shared, to_trimmed)?;
+    if !src.exists() {
+        return Err(BrowseError::NotFound(from.to_string()));
+    }
+    if dst.exists() {
+        return Err(BrowseError::NotADirectory(format!(
+            "target '{to_trimmed}' already exists"
+        )));
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&src, &dst)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +939,191 @@ mod tests {
         let (_dir, cfg) = workspace_fixture();
         let err = make_agent_workspace_directory(&cfg, "alpha", "").unwrap_err();
         assert!(matches!(err, BrowseError::NotFound(_)));
+    }
+
+    // ── shared file operations ────────────────────────────────────────
+
+    #[test]
+    fn write_file_creates_with_content() {
+        let (dir, cfg) = fixture();
+        write_file(&cfg, "data.txt", b"hello world").unwrap();
+        let p = dir.path().join("shared/data.txt");
+        assert!(p.is_file());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn write_file_creates_parent_dirs() {
+        let (dir, cfg) = fixture();
+        write_file(&cfg, "nested/deep/file.txt", b"test").unwrap();
+        assert!(dir.path().join("shared/nested/deep/file.txt").is_file());
+    }
+
+    #[test]
+    fn write_file_rejects_escape() {
+        let (_dir, cfg) = fixture();
+        let err = write_file(&cfg, "../etc/passwd", b"pwned").unwrap_err();
+        assert!(matches!(err, BrowseError::Escape(_)));
+    }
+
+    #[test]
+    fn write_file_rejects_empty_path() {
+        let (_dir, cfg) = fixture();
+        let err = write_file(&cfg, "", b"").unwrap_err();
+        assert!(matches!(err, BrowseError::NotFound(_)));
+    }
+
+    #[test]
+    fn write_file_rejects_oversize() {
+        let (_dir, cfg) = fixture();
+        let big = vec![b'x'; (SHARED_UPLOAD_CAP + 1) as usize];
+        let err = write_file(&cfg, "big.bin", &big).unwrap_err();
+        assert!(matches!(err, BrowseError::TooLarge(_, _)));
+    }
+
+    #[test]
+    fn create_file_makes_empty() {
+        let (dir, cfg) = fixture();
+        create_file(&cfg, "empty.txt").unwrap();
+        let p = dir.path().join("shared/empty.txt");
+        assert!(p.is_file());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+    }
+
+    #[test]
+    fn create_file_rejects_existing() {
+        let (_dir, cfg) = fixture();
+        create_file(&cfg, "note.md").unwrap();
+        let err = create_file(&cfg, "note.md").unwrap_err();
+        assert!(matches!(err, BrowseError::Io(_)));
+    }
+
+    #[test]
+    fn create_file_rejects_escape() {
+        let (_dir, cfg) = fixture();
+        let err = create_file(&cfg, "../secret.txt").unwrap_err();
+        assert!(matches!(err, BrowseError::Escape(_)));
+    }
+
+    #[test]
+    fn read_shared_file_returns_content() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/doc.txt"), b"document").unwrap();
+        let r = read_shared_file(&cfg, "doc.txt").unwrap();
+        assert_eq!(r.bytes, b"document");
+        assert!(r.is_text);
+    }
+
+    #[test]
+    fn read_shared_file_errors_on_missing() {
+        let (_dir, cfg) = fixture();
+        let err = read_shared_file(&cfg, "nope.txt").unwrap_err();
+        assert!(matches!(err, BrowseError::NotFound(_)));
+    }
+
+    #[test]
+    fn read_shared_file_errors_on_directory() {
+        let (_dir, cfg) = fixture();
+        let err = read_shared_file(&cfg, "skills").unwrap_err();
+        assert!(matches!(err, BrowseError::NotADirectory(_)));
+    }
+
+    #[test]
+    fn read_shared_file_rejects_escape() {
+        let (_dir, cfg) = fixture();
+        let err = read_shared_file(&cfg, "../../etc/hosts").unwrap_err();
+        assert!(matches!(err, BrowseError::Escape(_)));
+    }
+
+    #[test]
+    fn delete_shared_path_removes_file() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/trash.txt"), b"bye").unwrap();
+        delete_shared_path(&cfg, "trash.txt").unwrap();
+        assert!(!dir.path().join("shared/trash.txt").exists());
+    }
+
+    #[test]
+    fn delete_shared_path_removes_directory_recursively() {
+        let (dir, cfg) = fixture();
+        make_directory(&cfg, "foo/bar").unwrap();
+        std::fs::write(dir.path().join("shared/foo/bar/baz.txt"), b"hi").unwrap();
+        delete_shared_path(&cfg, "foo").unwrap();
+        assert!(!dir.path().join("shared/foo").exists());
+    }
+
+    #[test]
+    fn delete_shared_path_refuses_protected() {
+        let (_dir, cfg) = fixture();
+        let err = delete_shared_path(&cfg, "skills").unwrap_err();
+        assert!(matches!(err, BrowseError::Protected(_)));
+    }
+
+    #[test]
+    fn delete_shared_path_allows_nested_under_protected() {
+        let (dir, cfg) = fixture();
+        std::fs::create_dir_all(dir.path().join("shared/skills/nested")).unwrap();
+        delete_shared_path(&cfg, "skills/nested").unwrap();
+        assert!(!dir.path().join("shared/skills/nested").exists());
+        assert!(dir.path().join("shared/skills").is_dir());
+    }
+
+    #[test]
+    fn delete_shared_path_rejects_escape() {
+        let (_dir, cfg) = fixture();
+        let err = delete_shared_path(&cfg, "../var/log").unwrap_err();
+        assert!(matches!(err, BrowseError::Escape(_)));
+    }
+
+    #[test]
+    fn move_shared_path_renames_file() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/a.txt"), b"orig").unwrap();
+        move_shared_path(&cfg, "a.txt", "b.txt").unwrap();
+        assert!(!dir.path().join("shared/a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shared/b.txt")).unwrap(),
+            "orig"
+        );
+    }
+
+    #[test]
+    fn move_shared_path_creates_dirs() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/src.txt"), b"moved").unwrap();
+        move_shared_path(&cfg, "src.txt", "archive/sub/src.txt").unwrap();
+        assert!(dir.path().join("shared/archive/sub/src.txt").is_file());
+    }
+
+    #[test]
+    fn move_shared_path_refuses_overwrite() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/x.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("shared/y.txt"), b"y").unwrap();
+        let err = move_shared_path(&cfg, "x.txt", "y.txt").unwrap_err();
+        assert!(matches!(err, BrowseError::NotADirectory(_)));
+    }
+
+    #[test]
+    fn move_shared_path_refuses_protected_source() {
+        let (_dir, cfg) = fixture();
+        let err = move_shared_path(&cfg, "skills", "old_skills").unwrap_err();
+        assert!(matches!(err, BrowseError::Protected(_)));
+    }
+
+    #[test]
+    fn move_shared_path_refuses_protected_dest() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/tmp.txt"), b"tmp").unwrap();
+        let err = move_shared_path(&cfg, "tmp.txt", "skills").unwrap_err();
+        assert!(matches!(err, BrowseError::Protected(_)));
+    }
+
+    #[test]
+    fn move_shared_path_rejects_escape() {
+        let (dir, cfg) = fixture();
+        std::fs::write(dir.path().join("shared/ok.txt"), b"ok").unwrap();
+        let err = move_shared_path(&cfg, "ok.txt", "../etc/evil.txt").unwrap_err();
+        assert!(matches!(err, BrowseError::Escape(_)));
     }
 }

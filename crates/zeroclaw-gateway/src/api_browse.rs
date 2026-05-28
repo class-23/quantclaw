@@ -6,16 +6,17 @@
 
 use axum::{
     Json,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::browse::{
-    BrowseEntry, BrowseError, delete_agent_workspace_path, list_agent_workspace, list_directory,
-    make_agent_workspace_directory, make_directory, move_agent_workspace_path,
-    read_agent_workspace_file, remove_directory,
+    BrowseEntry, BrowseError, create_file, delete_agent_workspace_path, delete_shared_path,
+    list_agent_workspace, list_directory, make_agent_workspace_directory, make_directory,
+    move_agent_workspace_path, move_shared_path, read_agent_workspace_file, read_shared_file,
+    remove_directory, write_file,
 };
 
 use super::AppState;
@@ -236,6 +237,156 @@ pub async fn handle_agent_workspace_mkdir(
     let config = state.config.read().clone();
     match make_agent_workspace_directory(&config, &alias, &body.path) {
         Ok(()) => Json(serde_json::json!({ "created": body.path })).into_response(),
+        Err(err) => browse_error_response(err),
+    }
+}
+
+// ── Shared file upload ────────────────────────────────────────────────────
+
+/// `POST /api/browse/upload` — multipart file upload into
+/// `<install>/shared/<path>/<filename>`. The optional `path` form field
+/// specifies a subdirectory under shared/.
+pub async fn handle_browse_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut data: Vec<u8> = Vec::new();
+    let mut file_name = String::from("upload");
+    let mut sub_path = String::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            file_name = field
+                .file_name()
+                .unwrap_or("upload")
+                .to_string();
+            match field.bytes().await {
+                Ok(bytes) => data = bytes.to_vec(),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": format!("read error: {e}") })),
+                    )
+                        .into_response();
+                }
+            }
+        } else if name == "path" {
+            match field.text().await {
+                Ok(s) => sub_path = s,
+                Err(_) => {}
+            }
+        }
+    }
+
+    if data.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no file data received" })),
+        )
+            .into_response();
+    }
+
+    let relative = if sub_path.is_empty() {
+        file_name.clone()
+    } else {
+        format!("{}/{}", sub_path.trim_end_matches('/'), file_name)
+    };
+
+    let config = state.config.read().clone();
+    match write_file(&config, &relative, &data) {
+        Ok(size) => {
+            Json(serde_json::json!({ "uploaded": relative, "size": size })).into_response()
+        }
+        Err(err) => browse_error_response(err),
+    }
+}
+
+/// `GET /api/browse/read?path=<relative-to-shared>` — read a file from shared.
+pub async fn handle_browse_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BrowseQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    let raw = q.path.unwrap_or_default();
+    match read_shared_file(&config, &raw) {
+        Ok(result) => {
+            let (content, encoding) = if result.is_text {
+                (String::from_utf8(result.bytes).unwrap_or_default(), "utf8")
+            } else {
+                (
+                    base64::engine::general_purpose::STANDARD.encode(&result.bytes),
+                    "base64",
+                )
+            };
+            Json(FileReadResponse {
+                path: result.path,
+                size: result.size,
+                is_text: result.is_text,
+                content,
+                encoding,
+            })
+            .into_response()
+        }
+        Err(err) => browse_error_response(err),
+    }
+}
+
+/// `DELETE /api/browse/path` body `{ path: "<rel>" }` — delete a file
+/// or directory under shared/.
+pub async fn handle_browse_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BrowsePathBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    match delete_shared_path(&config, &body.path) {
+        Ok(()) => Json(serde_json::json!({ "removed": body.path })).into_response(),
+        Err(err) => browse_error_response(err),
+    }
+}
+
+/// `POST /api/browse/move` body `{ from, to }` — rename or move a path
+/// under shared/.
+pub async fn handle_browse_move(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MoveBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    match move_shared_path(&config, &body.from, &body.to) {
+        Ok(()) => Json(serde_json::json!({ "from": body.from, "to": body.to })).into_response(),
+        Err(err) => browse_error_response(err),
+    }
+}
+
+/// `POST /api/browse/mkfile` body `{ path: "<rel>" }` — create an empty
+/// file under shared/.
+pub async fn handle_browse_mkfile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BrowsePathBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    match create_file(&config, &body.path) {
+        Ok(created) => Json(serde_json::json!({ "created": created })).into_response(),
         Err(err) => browse_error_response(err),
     }
 }

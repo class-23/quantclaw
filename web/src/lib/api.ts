@@ -1421,3 +1421,73 @@ export function getCliTools(): Promise<CliTool[]> {
     return Array.isArray(result) ? result : [];
   });
 }
+
+// ---------------------------------------------------------------------------
+// Shared workspace file operations (FileManager panel)
+// ---------------------------------------------------------------------------
+
+export async function uploadFile(
+  file: File,
+  path?: string,
+  onProgress?: (pct: number) => void,
+): Promise<{ uploaded: string; size: number }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  if (path) formData.append('path', path);
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${apiOrigin}${basePath}/api/browse/upload`);
+
+    const token = getToken();
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress((e.loaded / e.total) * 100);
+      }
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error(`Invalid JSON response: ${xhr.responseText}`));
+        }
+      } else {
+        reject(new Error(`Upload failed (${xhr.status}): ${xhr.responseText}`));
+      }
+    });
+
+    xhr.addEventListener('error', () => reject(new Error('Upload network error')));
+    xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
+
+    xhr.send(formData);
+  });
+}
+
+export function readSharedFile(path: string): Promise<{ content: string; is_text: boolean; size: number }> {
+  return apiFetch(`/api/browse/read?path=${encodeURIComponent(path)}`);
+}
+
+export function deleteSharedPath(path: string): Promise<{ removed: string }> {
+  return apiFetch('/api/browse/path', {
+    method: 'DELETE',
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function moveSharedPath(from: string, to: string): Promise<{ from: string; to: string }> {
+  return apiFetch('/api/browse/move', {
+    method: 'POST',
+    body: JSON.stringify({ from, to }),
+  });
+}
+
+export function createSharedFile(path: string): Promise<{ created: string }> {
+  return apiFetch('/api/browse/mkfile', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}

@@ -1335,6 +1335,11 @@ pub async fn run_gateway(
         .route("/api/browse", get(api_browse::handle_browse))
         .route("/api/browse/mkdir", post(api_browse::handle_browse_mkdir))
         .route("/api/browse/rmdir", delete(api_browse::handle_browse_rmdir))
+        .route("/api/browse/upload", post(api_browse::handle_browse_upload))
+        .route("/api/browse/read", get(api_browse::handle_browse_read))
+        .route("/api/browse/path", delete(api_browse::handle_browse_delete))
+        .route("/api/browse/move", post(api_browse::handle_browse_move))
+        .route("/api/browse/mkfile", post(api_browse::handle_browse_mkfile))
         .route(
             "/api/agents/{alias}/workspace/list",
             get(api_browse::handle_agent_workspace_list),

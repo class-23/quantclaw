@@ -10,6 +10,7 @@ import { basePath } from './lib/basePath';
 import { ConfigDraftProvider } from './lib/draftStore';
 import { setLocale, t, type Locale } from './lib/i18n';
 import { Router } from './router/router';
+import FileManager from './components/FileManager';
 
 // Locale context
 interface LocaleContextType {
@@ -239,6 +240,7 @@ function AppContent() {
         <LocaleContext.Provider value={{ locale, setAppLocale }}>
           <FreshInstallRedirect />
           <Router />
+          {isAuthenticated && <FileManager />}
         </LocaleContext.Provider>
       </ConfigDraftProvider>
     </DraftContext.Provider>
